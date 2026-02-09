@@ -1,0 +1,12 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "core"
+version = "0.1.0"
+description = "Paquete del core de la arquitectura hexagonal"
+requires-python = ">=3.13"
+
+[tool.setuptools]
+packages = ["core"]
