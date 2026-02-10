@@ -9,6 +9,7 @@ from infrastructure.mongo.repository.tarea_repository import MongoTareaRepositor
 from infrastructure.sqlalchemy.repository.tarea_repository import (
     SqlAlchemyTareaRepository,
 )
+from infrastructure.dual.repository.tarea_repository import DualTareaRepository
 
 
 def get_tarea_repository() -> TareaRepository:
@@ -16,7 +17,11 @@ def get_tarea_repository() -> TareaRepository:
 
     if orm == "mongo":
         return MongoTareaRepository()
-
+    elif orm == "dual":
+        return DualTareaRepository(
+            sql_repository=SqlAlchemyTareaRepository(),
+            mongo_repository=MongoTareaRepository(),
+        )
     return SqlAlchemyTareaRepository()
 
 
