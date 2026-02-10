@@ -11,7 +11,6 @@ from backend_fastapi.api.deps import (
 )
 from core.application.crear_tarea import CrearTareaCommand, CrearTareaUseCase
 from core.application.editar_tarea import EditarTareaCommand, EditarTareaUseCase
-from core.application.eliminar_tarea import EliminarTareaUseCase
 from core.application.listar_tareas import ListarTareasUseCase
 
 router = APIRouter(prefix="/tareas", tags=["tareas"])
