@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TUI Task Manager</title>
+    <link rel="stylesheet" href="css/style.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="terminal">
+        <!-- Header -->
+        <header class="terminal-header">
+            <div class="terminal-controls">
+                <span class="control close"></span>
+                <span class="control minimize"></span>
+                <span class="control maximize"></span>
+            </div>
+            <div class="terminal-title">
+                <span class="prompt">➜</span>
+                <span class="path">~/task-manager</span>
+                <span class="git">(main)</span>
+            </div>
+            <div class="connection-status">
+                <span id="status-indicator" class="status online">●</span>
+                <span id="status-text">connected</span>
+            </div>
+        </header>
+
+        <!-- Main Content -->
+        <main class="terminal-content">
+            <!-- Command Input Section -->
+            <section class="command-section">
+                <div class="input-line">
+                    <span class="prompt">$</span>
+                    <input type="text" id="command-input" class="command-input" placeholder="Escribe 'help' para ver comandos disponibles..." autocomplete="off">
+                </div>
+                <div id="command-hint" class="command-hint hidden">
+                    <span class="hint-text">Comandos: create, list, edit, delete, help, clear</span>
+                </div>
+            </section>
+
+            <!-- Stats Bar -->
+            <section class="stats-bar">
+                <div class="stat-item">
+                    <span class="stat-label">TOTAL:</span>
+                    <span id="stat-total" class="stat-value">0</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label pending">PENDIENTE:</span>
+                    <span id="stat-pending" class="stat-value">0</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label progress">EN_PROGRESO:</span>
+                    <span id="stat-progress" class="stat-value">0</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label completed">COMPLETADA:</span>
+                    <span id="stat-completed" class="stat-value">0</span>
+                </div>
+            </section>
+
+            <!-- Output Area -->
+            <section class="output-section">
+                <div id="output" class="output">
+                    <div class="welcome-message">
+                        <pre class="ascii-art">
+╔══════════════════════════════════════════════════════════════╗
+║              TUI TASK MANAGER v1.0.0                          ║
+╚══════════════════════════════════════════════════════════════╝
+                        </pre>
+                        <p class="welcome-text">Bienvenido al gestor de tareas con estilo terminal.</p>
+                        <p class="welcome-hint">Escribe <span class="cmd-highlight">help</span> para ver los comandos disponibles.</p>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Quick Actions -->
+            <section class="quick-actions">
+                <button class="action-btn" onclick="app.executeCommand('list')">
+                    <span class="btn-icon">📋</span>
+                    <span class="btn-text">Listar</span>
+                </button>
+                <button class="action-btn" onclick="app.openCreateModal()">
+                    <span class="btn-icon">➕</span>
+                    <span class="btn-text">Crear</span>
+                </button>
+                <button class="action-btn" onclick="app.executeCommand('clear')">
+                    <span class="btn-icon">🧹</span>
+                    <span class="btn-text">Limpiar</span>
+                </button>
+            </section>
+        </main>
+
+        <!-- Create Task Modal -->
+        <div id="create-modal" class="modal hidden">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <span class="modal-title">$ create --new-task</span>
+                    <button class="modal-close" onclick="app.closeCreateModal()">×</button>
+                </div>
+                <form id="create-form" class="modal-form">
+                    <div class="form-group">
+                        <label class="form-label">Título:</label>
+                        <input type="text" id="create-title" class="form-input" placeholder="Nombre de la tarea" required>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Descripción:</label>
+                        <textarea id="create-description" class="form-textarea" placeholder="Descripción opcional..."></textarea>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Estado:</label>
+                        <select id="create-status" class="form-select">
+                            <option value="pendiente">PENDIENTE</option>
+                            <option value="en_progreso">EN_PROGRESO</option>
+                            <option value="completada">COMPLETADA</option>
+                        </select>
+                    </div>
+                    <div class="form-actions">
+                        <button type="button" class="btn btn-secondary" onclick="app.closeCreateModal()">Cancelar</button>
+                        <button type="submit" class="btn btn-primary">Crear</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+
+        <!-- Edit Task Modal -->
+        <div id="edit-modal" class="modal hidden">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <span class="modal-title">$ edit --task</span>
+                    <button class="modal-close" onclick="app.closeEditModal()">×</button>
+                </div>
+                <form id="edit-form" class="modal-form">
+                    <input type="hidden" id="edit-id">
+                    <div class="form-group">
+                        <label class="form-label">Título:</label>
+                        <input type="text" id="edit-title" class="form-input" required>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Descripción:</label>
+                        <textarea id="edit-description" class="form-textarea"></textarea>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Estado:</label>
+                        <select id="edit-status" class="form-select">
+                            <option value="pendiente">PENDIENTE</option>
+                            <option value="en_progreso">EN_PROGRESO</option>
+                            <option value="completada">COMPLETADA</option>
+                        </select>
+                    </div>
+                    <div class="form-actions">
+                        <button type="button" class="btn btn-secondary" onclick="app.closeEditModal()">Cancelar</button>
+                        <button type="submit" class="btn btn-primary">Guardar</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+
+        <!-- Footer -->
+        <footer class="terminal-footer">
+            <div class="footer-left">
+                <span class="footer-info">READY</span>
+            </div>
+            <div class="footer-center">
+                <span class="keyboard-hint">[Tab] autocomplete</span>
+                <span class="keyboard-hint">[Enter] execute</span>
+                <span class="keyboard-hint">[Esc] cancel</span>
+            </div>
+            <div class="footer-right">
+                <span id="last-update" class="footer-info">--:--:--</span>
+            </div>
+        </footer>
+    </div>
+
+    <script src="js/app.js"></script>
+</body>
+</html>
