@@ -1,6 +1,7 @@
 from sqlalchemy import Column, String, Text
 from infrastructure.sqlalchemy.session.db import Base
 
+
 class TareaModel(Base):
     __tablename__ = "tareas"
 
