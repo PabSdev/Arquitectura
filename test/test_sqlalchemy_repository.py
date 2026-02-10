@@ -8,7 +8,9 @@ from core.domain.models.tarea import EstadoTarea, Tarea
 
 try:
     from infrastructure.sqlalchemy.session.db import Base, engine
-    from infrastructure.sqlalchemy.repository.tarea_repository import SqlAlchemyTareaRepository
+    from infrastructure.sqlalchemy.repository.tarea_repository import (
+        SqlAlchemyTareaRepository,
+    )
 
     HAS_SQLALCHEMY = True
 except ModuleNotFoundError:

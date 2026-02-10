@@ -22,5 +22,6 @@ def editar_tarea_use_case() -> EditarTareaUseCase:
 def eliminar_tarea_use_case() -> EliminarTareaUseCase:
     return get_eliminar_tarea_use_case()
 
+
 def listar_tareas_use_case() -> ListarTareasUseCase:
     return get_listar_tareas_use_case()
