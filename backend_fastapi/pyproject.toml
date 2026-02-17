@@ -7,4 +7,5 @@ dependencies = [
     "core",
     "infrastructure",
     "fastapi",
+    "python-dotenv>=1.0.0",
 ]
