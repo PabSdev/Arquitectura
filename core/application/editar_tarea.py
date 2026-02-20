@@ -22,7 +22,8 @@ class EditarTareaUseCase:
             raise ValueError(f"Tarea con id {tarea_id} no encontrada")
 
         tarea.titulo = cmd.titulo
-        tarea.descripcion = cmd.descripcion
+        if cmd.descripcion is not None:
+            tarea.descripcion = cmd.descripcion
         tarea.estado = cmd.estado
 
         self._repository.save(tarea)

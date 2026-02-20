@@ -11,6 +11,7 @@ from backend_fastapi.api.deps import (
 )
 from core.application.crear_tarea import CrearTareaCommand, CrearTareaUseCase
 from core.application.editar_tarea import EditarTareaCommand, EditarTareaUseCase
+from core.application.eliminar_tarea import EliminarTareaCommand, EliminarTareaUseCase
 from core.application.listar_tareas import ListarTareasUseCase
 
 router = APIRouter(prefix="/tareas", tags=["tareas"])
@@ -90,4 +91,4 @@ def eliminar_tarea(
 
     - **tarea_id**: UUID de la tarea a eliminar.
     """
-    use_case.execute(tarea_id)
+    use_case.execute(EliminarTareaCommand(tarea_id))
