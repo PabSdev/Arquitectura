@@ -2,7 +2,7 @@
 
 ## 📖 Descripción
 
-El **DualTareaRepository** implementa un patrón de migración sin downtime que permite escribir y leer desde dos bases de datos simultáneamente (SQLAlchemy y MongoDB).
+El **DualTareaRepository** implementa un patrón de migración sin downtime que permite escribir y leer desde dos bases de datos simultáneamente (Peewee/SQL y MongoDB).
 
 Antes de cualquier operación de **escritura**, se realiza un **ping en paralelo** a ambas bases de datos. Si una no responde, se avisa con un warning y la operación se dirige únicamente a la BDD disponible.
 
@@ -19,16 +19,16 @@ Facilitar la migración de datos entre diferentes sistemas de persistencia sin i
 ```mermaid
 graph TB
     A[Application Layer] --> B{Container}
-    B -->|ORM=sqlalchemy| C[SqlAlchemyTareaRepository]
+    B -->|ORM=peewee| C[PeeweeTareaRepository]
     B -->|ORM=mongo| D[MongoTareaRepository]
     B -->|ORM=dual| E[DualTareaRepository]
 
     E --> P["🏓 Ping paralelo (max_workers=4)"]
-    P -->|ping_postgres| G[(PostgreSQL)]
+    P -->|ping_sql| G[(SQL/Postgres)]
     P -->|ping_mongo| H[(MongoDB)]
 
     P -->|ambas OK| F[Dual-Write paralelo]
-    P -->|solo Postgres OK| C
+    P -->|solo SQL OK| C
     P -->|solo Mongo OK| D
     P -->|ninguna OK| X[❌ Exception]
 
@@ -54,7 +54,7 @@ El repositorio dual implementa el **patrón Adapter** de la arquitectura hexagon
 │  ┌──────────────────────────┴────────────────────────────┐ │
 │  │              DualTareaRepository                      │ │
 │  │  ┌─────────────────┐      ┌────────────────────────┐ │ │
-│  │  │  SQLAlchemy     │      │  MongoDB               │ │ │
+│  │  │  Peewee         │      │  MongoDB               │ │ │
 │  │  │  Repository     │      │  Repository            │ │ │
 │  │  └────────┬────────┘      └───────────┬────────────┘ │ │
 │  └───────────┼───────────────────────────┼──────────────┘ │
@@ -77,19 +77,19 @@ sequenceDiagram
     participant Client
     participant DualRepo as DualTareaRepository
     participant Executor as ThreadPoolExecutor
-    participant SQL as SQLAlchemy Repo
+    participant SQL as Peewee Repo
     participant Mongo as MongoDB Repo
 
     Client->>DualRepo: save(tarea) / eliminar(id)
     note over DualRepo,Executor: 🏓 Ping en PARALELO (ambas BDD a la vez)
-    DualRepo->>Executor: submit(_ping_postgres)
+    DualRepo->>Executor: submit(_ping_sql)
     DualRepo->>Executor: submit(_ping_mongo)
-    Executor-->>DualRepo: postgres_ok, mongo_ok
+    Executor-->>DualRepo: sql_ok, mongo_ok
 
     alt Ninguna disponible
         DualRepo-->>Client: ❌ Exception inmediata
-    else Solo Postgres disponible
-        DualRepo-->>Client: ⚠️ Warning — guardando solo en Postgres
+    else Solo SQL disponible
+        DualRepo-->>Client: ⚠️ Warning — guardando solo en SQL
         DualRepo->>SQL: operación
     else Solo Mongo disponible
         DualRepo-->>Client: ⚠️ Warning — guardando solo en MongoDB
@@ -116,7 +116,7 @@ sequenceDiagram
 sequenceDiagram
     participant Client
     participant DualRepo as DualTareaRepository
-    participant SQL as SQLAlchemy Repo
+    participant SQL as Peewee Repo
     participant Mongo as MongoDB Repo
     
     Client->>DualRepo: get(id)
@@ -134,8 +134,8 @@ sequenceDiagram
 ```
 
 **Operaciones:**
-- **get()**: Lee de SQLAlchemy (principal), con fallback a MongoDB
-- **list()**: Lee de SQLAlchemy (principal), con fallback a MongoDB
+- **get()**: Lee de Peewee (principal), con fallback a MongoDB
+- **list()**: Lee de Peewee (principal), con fallback a MongoDB
 
 ---
 
@@ -159,9 +159,9 @@ uvicorn backend_fastapi.main:app --reload
 
 ### Desactivar el Modo Dual
 
-#### Volver a SQLAlchemy (por defecto):
+#### Volver a Peewee (por defecto):
 ```powershell
-$env:ORM="sqlalchemy"
+$env:ORM="peewee"
 # o simplemente no definir ORM
 ```
 
@@ -180,9 +180,9 @@ Antes de cada `save()` o `eliminar()`, se hace ping en paralelo a ambas BDD. La 
 
 ```python
 # Pings en paralelo — no suma latencias, solo espera el más lento
-future_sql   = executor.submit(_ping_postgres)
+future_sql   = executor.submit(_ping_sql)
 future_mongo = executor.submit(_ping_mongo)
-postgres_ok  = future_sql.result(timeout=4)
+sql_ok       = future_sql.result(timeout=4)
 mongo_ok     = future_mongo.result(timeout=4)
 ```
 
@@ -197,14 +197,14 @@ executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="DualRepo")
 
 ### ✅ Imports a nivel de módulo
 
-`psycopg` y `MongoClient` se importan **una sola vez** al arrancar el módulo (no en cada llamada a `ping_postgres`/`ping_mongo`), eliminando el overhead repetido de import:
+`psycopg` y `MongoClient` se importan **una sola vez** al arrancar el módulo (no en cada llamada a `_ping_sql`/`_ping_mongo`), eliminando el overhead repetido de import:
 
 ### ✅ Tolerancia a Fallos con dispatch condicional
 
 ```mermaid
 flowchart TD
     A[save / eliminar] --> P["🏓 Ping paralelo"]
-    P --> B{postgres_ok}
+    P --> B{sql_ok}
     P --> C{mongo_ok}
 
     B -- No --> OnlyMongo{mongo_ok?}
@@ -213,7 +213,7 @@ flowchart TD
     OnlyMongo -- Sí --> M["⚠️ Solo MongoDB"]
     OnlyMongo -- No --> X["❌ Exception inmediata"]
 
-    BothCheck -- No --> S["⚠️ Solo Postgres"]
+    BothCheck -- No --> S["⚠️ Solo SQL"]
     BothCheck -- Sí --> Dual["🔄 Dual-Write paralelo"]
 
     Dual --> R{Resultado escritura}
@@ -234,13 +234,13 @@ El repositorio dual incluye emojis y mensajes claros para facilitar el debugging
 ```
 🏓 Ping previo a BDD para save de <uuid>...
 🔴 Mongo no disponible: <error>          ← BDD caída
-⚠️ MongoDB no disponible. save de <uuid> se guardará SOLO en Postgres.
-✓ Operación SQLAlchemy (solo) completada
+⚠️ MongoDB no disponible. save de <uuid> se guardará SOLO en SQL.
+✓ Operación Peewee (solo) completada
 
 # Cuando ambas están OK:
 🏓 Ping previo a BDD para save de <uuid>...
 🔄 save dual iniciado para <uuid>
-✓ Operación SQLAlchemy completada
+✓ Operación Peewee completada
 ✓ Operación MongoDB completada
 ✅ save dual exitoso para <uuid>
 ```
@@ -296,11 +296,11 @@ Puedes inyectar instancias personalizadas de los repositorios:
 
 ```python
 from infrastructure.dual.repository.tarea_repository import DualTareaRepository
-from infrastructure.sqlalchemy.repository.tarea_repository import SqlAlchemyTareaRepository
+from infrastructure.peewee.repository.tarea_repository import PeeweeTareaRepository
 from infrastructure.mongo.repository.tarea_repository import MongoTareaRepository
 
 # Repositorios personalizados
-sql_repo = SqlAlchemyTareaRepository()
+sql_repo = PeeweeTareaRepository()
 mongo_repo = MongoTareaRepository()
 
 # Inyección manual
@@ -360,10 +360,10 @@ class TareaRepository(ABC):
 
 **2. Implementar en Repositorios Base:**
 ```python
-# infrastructure/sqlalchemy/repository/tarea_repository.py
-class SqlAlchemyTareaRepository(TareaRepository):
+# infrastructure/peewee/repository/tarea_repository.py
+class PeeweeTareaRepository(TareaRepository):
     def nuevo_metodo(self, tarea_id: UUID) -> Tarea:
-        # Implementación SQLAlchemy
+        # Implementación Peewee
         pass
 
 # infrastructure/mongo/repository/tarea_repository.py
@@ -395,13 +395,13 @@ def nuevo_metodo_read(self, tarea_id: UUID) -> Tarea | None:
     """Operación de lectura con fallback."""
     logger.debug(f"🔍 Buscando tarea {tarea_id}")
     
-    # Intenta leer de SQLAlchemy primero
+    # Intenta leer de Peewee primero
     try:
         result = self._sql_repo.nuevo_metodo_read(tarea_id)
         if result is not None:
             return result
     except Exception as e:
-        logger.warning(f"⚠️ Error en SQLAlchemy: {e}")
+        logger.warning(f"⚠️ Error en Peewee: {e}")
     
     # Fallback a MongoDB
     try:
@@ -444,14 +444,14 @@ def get(self, tarea_id: UUID) -> Tarea | None:
     except Exception as e:
         logger.warning(f"⚠️ Error en MongoDB: {e}")
     
-    # Fallback a SQLAlchemy
+    # Fallback a Peewee
     try:
         tarea = self._sql_repo.get(tarea_id)
         if tarea is not None:
-            logger.info(f"✓ Obtenido de SQLAlchemy (fallback)")
+            logger.info(f"✓ Obtenido de Peewee (fallback)")
             return tarea
     except Exception as e:
-        logger.warning(f"⚠️ Error en SQLAlchemy: {e}")
+        logger.warning(f"⚠️ Error en Peewee: {e}")
     
     return None
 ```

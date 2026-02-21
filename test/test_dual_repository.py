@@ -28,9 +28,14 @@ class TestDualTareaRepository:
     @pytest.fixture
     def dual_repo(self, mock_sql_repo, mock_mongo_repo):
         """Fixture del repositorio dual con mocks."""
-        return DualTareaRepository(
-            sql_repository=mock_sql_repo, mongo_repository=mock_mongo_repo
-        )
+        # Patch pings to return success by default to avoid real network calls
+        with patch(
+            "infrastructure.dual.repository.tarea_repository._ping_ambas_bdd",
+            return_value=(True, True),
+        ):
+            yield DualTareaRepository(
+                sql_repository=mock_sql_repo, mongo_repository=mock_mongo_repo
+            )
 
     @pytest.fixture
     def tarea_ejemplo(self):
@@ -416,19 +421,20 @@ class TestDualTareaRepository:
 class TestDualTareaRepositoryIntegration:
     """Tests de integración (requieren bases de datos reales)."""
 
+    @pytest.mark.skip(reason="Requires running DBs")
     @pytest.mark.integration
     def test_dual_write_integration(self):
         """Test de integración: Verifica escritura dual real."""
         # Este test requiere ambas DBs configuradas
-        from infrastructure.sqlalchemy.repository.tarea_repository import (
-            SqlAlchemyTareaRepository,
+        from infrastructure.peewee.repository.tarea_repository import (
+            PeeweeTareaRepository,
         )
         from infrastructure.mongo.repository.tarea_repository import (
             MongoTareaRepository,
         )
 
         # Arrange
-        sql_repo = SqlAlchemyTareaRepository()
+        sql_repo = PeeweeTareaRepository()
         mongo_repo = MongoTareaRepository()
         dual_repo = DualTareaRepository(
             sql_repository=sql_repo, mongo_repository=mongo_repo

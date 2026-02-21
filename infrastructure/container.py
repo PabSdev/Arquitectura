@@ -6,23 +6,24 @@ from core.application.eliminar_tarea import EliminarTareaUseCase
 from core.application.listar_tareas import ListarTareasUseCase
 from core.domain.ports.tarea_repository import TareaRepository
 from infrastructure.mongo.repository.tarea_repository import MongoTareaRepository
-from infrastructure.sqlalchemy.repository.tarea_repository import (
-    SqlAlchemyTareaRepository,
+from infrastructure.peewee.repository.tarea_repository import (
+    PeeweeTareaRepository,
 )
 from infrastructure.dual.repository.tarea_repository import DualTareaRepository
 
 
 def get_tarea_repository() -> TareaRepository:
-    orm = os.getenv("ORM", "sqlalchemy").lower()
+    orm = os.getenv("ORM", "peewee").lower()
 
     if orm == "mongo":
         return MongoTareaRepository()
     elif orm == "dual":
         return DualTareaRepository(
-            sql_repository=SqlAlchemyTareaRepository(),
+            sql_repository=PeeweeTareaRepository(),
             mongo_repository=MongoTareaRepository(),
         )
-    return SqlAlchemyTareaRepository()
+    # Default to Peewee
+    return PeeweeTareaRepository()
 
 
 def get_crear_tarea_use_case() -> CrearTareaUseCase:

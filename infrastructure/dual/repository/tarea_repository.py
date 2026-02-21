@@ -9,8 +9,8 @@ from pymongo import MongoClient
 
 from core.domain.models.tarea import Tarea
 from core.domain.ports.tarea_repository import TareaRepository
-from infrastructure.sqlalchemy.repository.tarea_repository import (
-    SqlAlchemyTareaRepository,
+from infrastructure.peewee.repository.tarea_repository import (
+    PeeweeTareaRepository,
 )
 from infrastructure.mongo.repository.tarea_repository import MongoTareaRepository
 from infrastructure.dual.circuit_breaker import CircuitBreaker
@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="DualRepo")
 
 # ── Configuración de conexión (variables locales en módulo → acceso más rápido) ──
-_POSTGRES_DSN = os.getenv("DATABASE_URL")
+_SQL_DSN = os.getenv("DATABASE_URL")
 _MONGO_DSN = os.getenv("MONGO_URI")
 _PING_TIMEOUT_SECS = 3
 _PING_TIMEOUT_MS = _PING_TIMEOUT_SECS * 1000
@@ -36,20 +36,26 @@ _RETRY_BASE_DELAY = 0.5           # Delay base (se duplica por retry)
 _PARALLEL_TIMEOUT = 10.0          # Timeout para operaciones paralelas
 
 
-def _ping_postgres() -> bool:
+def _ping_sql() -> bool:
     """
-    Hace ping a PostgreSQL con timeout controlado.
+    Hace ping a la base de datos SQL (Postgres o SQLite).
 
     Returns:
         True si la BDD está disponible, False en caso contrario.
     """
+    # Si es SQLite, asumimos que está disponible (es un archivo local o memoria)
+    if not _SQL_DSN or _SQL_DSN.startswith("sqlite"):
+        return True
+
     try:
-        # psycopg2: connect_timeout es un kwarg separado, no parte del DSN
-        conn = psycopg2.connect(dsn=_POSTGRES_DSN, connect_timeout=_PING_TIMEOUT_SECS)
-        conn.close()
+        # Intento con psycopg2 si es Postgres
+        if "postgres" in _SQL_DSN:
+            conn = psycopg2.connect(dsn=_SQL_DSN, connect_timeout=_PING_TIMEOUT_SECS)
+            conn.close()
+            return True
         return True
     except Exception as e:
-        logger.error(f"🔴 Postgres no disponible: {e}")
+        logger.error(f"🔴 SQL no disponible: {e}")
         return False
 
 
@@ -72,23 +78,23 @@ def _ping_mongo() -> bool:
 
 def _ping_ambas_bdd() -> tuple[bool, bool]:
     """
-    Ejecuta los pings a PostgreSQL y MongoDB EN PARALELO.
+    Ejecuta los pings a SQL y MongoDB EN PARALELO.
     Latencia total = max(ping_sql, ping_mongo), no la suma.
 
     Returns:
-        Tupla (postgres_ok, mongo_ok)
+        Tupla (sql_ok, mongo_ok)
     """
-    future_sql = executor.submit(_ping_postgres)
+    future_sql = executor.submit(_ping_sql)
     future_mongo = executor.submit(_ping_mongo)
     # Esperamos ambos resultados (timeout máximo = _PING_TIMEOUT_SECS + margen)
-    postgres_ok = future_sql.result(timeout=_PING_TIMEOUT_SECS + 1)
+    sql_ok = future_sql.result(timeout=_PING_TIMEOUT_SECS + 1)
     mongo_ok = future_mongo.result(timeout=_PING_TIMEOUT_SECS + 1)
-    return postgres_ok, mongo_ok
+    return sql_ok, mongo_ok
 
 
 class DualTareaRepository(TareaRepository):
     """
-    Repositorio Dual que escribe y lee desde SQLAlchemy y MongoDB simultáneamente.
+    Repositorio Dual que escribe y lee desde Peewee (SQL) y MongoDB simultáneamente.
 
     Mejoras de resiliencia:
     - Circuit Breaker: evita golpear una BDD que sabemos que está caída.
@@ -100,28 +106,28 @@ class DualTareaRepository(TareaRepository):
       Si ambas responden → escribe en paralelo.
       Si solo una responde → avisa y escribe solo en la disponible.
       Si ninguna responde → falla inmediatamente sin intentar escribir.
-    - LECTURA (get/list): Lee de SQLAlchemy por defecto, con fallback a MongoDB.
-      Circuit Breaker puede saltar SQLAlchemy directo si está en estado OPEN.
+    - LECTURA (get/list): Lee de SQL (Peewee) por defecto, con fallback a MongoDB.
+      Circuit Breaker puede saltar SQL directo si está en estado OPEN.
     """
 
     def __init__(
         self,
-        sql_repository: SqlAlchemyTareaRepository | None = None,
+        sql_repository: PeeweeTareaRepository | None = None,
         mongo_repository: MongoTareaRepository | None = None,
     ) -> None:
         """
         Inicializa el repositorio dual con Circuit Breakers independientes.
 
         Args:
-            sql_repository: Repositorio SQLAlchemy. Si es None, se instancia automáticamente.
+            sql_repository: Repositorio Peewee. Si es None, se instancia automáticamente.
             mongo_repository: Repositorio MongoDB. Si es None, se instancia automáticamente.
         """
-        self._sql_repo = sql_repository or SqlAlchemyTareaRepository()
+        self._sql_repo = sql_repository or PeeweeTareaRepository()
         self._mongo_repo = mongo_repository or MongoTareaRepository()
 
         # ── Circuit Breakers independientes por BDD ──
         self._sql_circuit = CircuitBreaker(
-            name="SQLAlchemy",
+            name="Peewee",
             failure_threshold=_CIRCUIT_FAILURE_THRESHOLD,
             recovery_timeout=_CIRCUIT_RECOVERY_TIMEOUT,
         )
@@ -132,7 +138,7 @@ class DualTareaRepository(TareaRepository):
         )
 
         logger.info(
-            "DualTareaRepository inicializado con SQLAlchemy y MongoDB "
+            "DualTareaRepository inicializado con Peewee y MongoDB "
             "(Circuit Breaker + Retry habilitados)"
         )
 
@@ -148,7 +154,7 @@ class DualTareaRepository(TareaRepository):
         Incluye timeout explícito para evitar bloqueos indefinidos.
 
         Args:
-            sql_func: Función a ejecutar en SQLAlchemy
+            sql_func: Función a ejecutar en Peewee
             mongo_func: Función a ejecutar en MongoDB
 
         Returns:
@@ -170,7 +176,7 @@ class DualTareaRepository(TareaRepository):
                     if future is future_sql:
                         sql_result = result
                         self._sql_circuit.record_success()
-                        logger.debug("✓ Operación SQLAlchemy completada")
+                        logger.debug("✓ Operación Peewee completada")
                     else:
                         mongo_result = result
                         self._mongo_circuit.record_success()
@@ -179,7 +185,7 @@ class DualTareaRepository(TareaRepository):
                     if future is future_sql:
                         sql_error = e
                         self._sql_circuit.record_failure()
-                        logger.error(f"✗ SQLAlchemy falló: {e}")
+                        logger.error(f"✗ Peewee falló: {e}")
                     else:
                         mongo_error = e
                         self._mongo_circuit.record_failure()
@@ -187,9 +193,9 @@ class DualTareaRepository(TareaRepository):
         except TimeoutError:
             # as_completed timeout — marcar como error las que no terminaron
             if not future_sql.done():
-                sql_error = TimeoutError("SQLAlchemy excedió timeout paralelo")
+                sql_error = TimeoutError("Peewee excedió timeout paralelo")
                 self._sql_circuit.record_failure()
-                logger.error(f"⏰ SQLAlchemy timeout ({_PARALLEL_TIMEOUT}s)")
+                logger.error(f"⏰ Peewee timeout ({_PARALLEL_TIMEOUT}s)")
                 future_sql.cancel()
             if not future_mongo.done():
                 mongo_error = TimeoutError("MongoDB excedió timeout paralelo")
@@ -200,7 +206,7 @@ class DualTareaRepository(TareaRepository):
         return sql_result, sql_error, mongo_result, mongo_error
 
     def _execute_solo_sql(self, sql_func: Callable[[], Any]) -> None:
-        """Ejecuta la operación únicamente en SQLAlchemy con retry."""
+        """Ejecuta la operación únicamente en Peewee con retry."""
         try:
             retry_with_backoff(
                 sql_func,
@@ -208,10 +214,10 @@ class DualTareaRepository(TareaRepository):
                 base_delay=_RETRY_BASE_DELAY,
             )
             self._sql_circuit.record_success()
-            logger.debug("✓ Operación SQLAlchemy (solo) completada")
+            logger.debug("✓ Operación Peewee (solo) completada")
         except Exception as e:
             self._sql_circuit.record_failure()
-            logger.error(f"✗ SQLAlchemy (solo) falló: {e}")
+            logger.error(f"✗ Peewee (solo) falló: {e}")
             raise
 
     def _execute_solo_mongo(self, mongo_func: Callable[[], Any]) -> None:
@@ -267,14 +273,14 @@ class DualTareaRepository(TareaRepository):
         if sql_allowed and not mongo_allowed:
             logger.warning(
                 f"⚡ MongoDB circuit OPEN. {operacion} de {entidad_id} "
-                f"se guardará SOLO en SQLAlchemy."
+                f"se guardará SOLO en Peewee."
             )
             self._execute_solo_sql(sql_func)
             return
 
         if mongo_allowed and not sql_allowed:
             logger.warning(
-                f"⚡ SQLAlchemy circuit OPEN. {operacion} de {entidad_id} "
+                f"⚡ Peewee circuit OPEN. {operacion} de {entidad_id} "
                 f"se guardará SOLO en MongoDB."
             )
             self._execute_solo_mongo(mongo_func)
@@ -282,34 +288,34 @@ class DualTareaRepository(TareaRepository):
 
         # ── Ambos circuitos permiten → ping previo para confirmar ─────────────
         logger.info(f"🏓 Ping previo a BDD para {operacion} de {entidad_id}...")
-        postgres_ok, mongo_ok = _ping_ambas_bdd()
+        sql_ok, mongo_ok = _ping_ambas_bdd()
 
         # ── Ambas BDD caídas → falla rápida ──────────────────────────────────
-        if not postgres_ok and not mongo_ok:
+        if not sql_ok and not mongo_ok:
             self._sql_circuit.record_failure()
             self._mongo_circuit.record_failure()
             msg = (
                 f"❌ {operacion} abortado: ninguna BDD disponible "
-                f"(Postgres={postgres_ok}, Mongo={mongo_ok})"
+                f"(SQL={sql_ok}, Mongo={mongo_ok})"
             )
             logger.error(msg)
             raise Exception(msg)
 
-        # ── Solo Postgres disponible ──────────────────────────────────────────
-        if postgres_ok and not mongo_ok:
+        # ── Solo SQL disponible ──────────────────────────────────────────
+        if sql_ok and not mongo_ok:
             self._mongo_circuit.record_failure()
             logger.warning(
                 f"⚠️ MongoDB no disponible. {operacion} de {entidad_id} "
-                f"se guardará SOLO en Postgres."
+                f"se guardará SOLO en SQL."
             )
             self._execute_solo_sql(sql_func)
             return
 
         # ── Solo MongoDB disponible ───────────────────────────────────────────
-        if mongo_ok and not postgres_ok:
+        if mongo_ok and not sql_ok:
             self._sql_circuit.record_failure()
             logger.warning(
-                f"⚠️ Postgres no disponible. {operacion} de {entidad_id} "
+                f"⚠️ SQL no disponible. {operacion} de {entidad_id} "
                 f"se guardará SOLO en MongoDB."
             )
             self._execute_solo_mongo(mongo_func)
@@ -322,15 +328,15 @@ class DualTareaRepository(TareaRepository):
         if sql_error and mongo_error:
             error_msg = (
                 f"{operacion} falló en ambas bases de datos. "
-                f"SQLAlchemy: {sql_error}. MongoDB: {mongo_error}"
+                f"Peewee: {sql_error}. MongoDB: {mongo_error}"
             )
             logger.error(f"❌ {error_msg}")
             raise Exception(error_msg)
 
         if sql_error:
-            logger.warning(f"⚠️ SQLAlchemy falló pero MongoDB tuvo éxito en {operacion} {entidad_id}")
+            logger.warning(f"⚠️ Peewee falló pero MongoDB tuvo éxito en {operacion} {entidad_id}")
         elif mongo_error:
-            logger.warning(f"⚠️ MongoDB falló pero SQLAlchemy tuvo éxito en {operacion} {entidad_id}")
+            logger.warning(f"⚠️ MongoDB falló pero Peewee tuvo éxito en {operacion} {entidad_id}")
         else:
             logger.info(f"✅ {operacion} dual exitoso para {entidad_id}")
 
@@ -374,7 +380,7 @@ class DualTareaRepository(TareaRepository):
         """
         logger.debug(f"🔍 Buscando tarea {tarea_id}")
 
-        # ── Intento 1: SQLAlchemy (con Circuit Breaker + Retry) ──
+        # ── Intento 1: Peewee (con Circuit Breaker + Retry) ──
         if self._sql_circuit.allow_request():
             try:
                 tarea = retry_with_backoff(
@@ -384,14 +390,14 @@ class DualTareaRepository(TareaRepository):
                 )
                 self._sql_circuit.record_success()
                 if tarea is not None:
-                    logger.debug(f"✓ Tarea {tarea_id} obtenida de SQLAlchemy")
+                    logger.debug(f"✓ Tarea {tarea_id} obtenida de Peewee")
                     return tarea
             except Exception as e:
                 self._sql_circuit.record_failure()
-                logger.warning(f"⚠️ Error obteniendo de SQLAlchemy: {e}")
+                logger.warning(f"⚠️ Error obteniendo de Peewee: {e}")
         else:
             logger.info(
-                f"⚡ SQLAlchemy circuit OPEN — saltando directo a MongoDB "
+                f"⚡ Peewee circuit OPEN — saltando directo a MongoDB "
                 f"para get({tarea_id})"
             )
 
@@ -429,7 +435,7 @@ class DualTareaRepository(TareaRepository):
         """
         logger.debug("📋 Listando todas las tareas")
 
-        # ── Intento 1: SQLAlchemy ──
+        # ── Intento 1: Peewee ──
         if self._sql_circuit.allow_request():
             try:
                 tareas = retry_with_backoff(
@@ -438,13 +444,13 @@ class DualTareaRepository(TareaRepository):
                     base_delay=_RETRY_BASE_DELAY,
                 )
                 self._sql_circuit.record_success()
-                logger.debug(f"✓ Listadas {len(tareas)} tareas de SQLAlchemy")
+                logger.debug(f"✓ Listadas {len(tareas)} tareas de Peewee")
                 return tareas
             except Exception as e:
                 self._sql_circuit.record_failure()
-                logger.warning(f"⚠️ Error listando de SQLAlchemy: {e}, intentando MongoDB")
+                logger.warning(f"⚠️ Error listando de Peewee: {e}, intentando MongoDB")
         else:
-            logger.info("⚡ SQLAlchemy circuit OPEN — saltando directo a MongoDB para list()")
+            logger.info("⚡ Peewee circuit OPEN — saltando directo a MongoDB para list()")
 
         # ── Intento 2: MongoDB (fallback) ──
         if self._mongo_circuit.allow_request():
