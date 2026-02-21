@@ -4,6 +4,8 @@
 
 El **DualTareaRepository** implementa un patrón de migración sin downtime que permite escribir y leer desde dos bases de datos simultáneamente (SQLAlchemy y MongoDB).
 
+Antes de cualquier operación de **escritura**, se realiza un **ping en paralelo** a ambas bases de datos. Si una no responde, se avisa con un warning y la operación se dirige únicamente a la BDD disponible.
+
 ## 🎯 Objetivo
 
 Facilitar la migración de datos entre diferentes sistemas de persistencia sin interrumpir el servicio, siguiendo las mejores prácticas de la arquitectura hexagonal.
@@ -20,13 +22,18 @@ graph TB
     B -->|ORM=sqlalchemy| C[SqlAlchemyTareaRepository]
     B -->|ORM=mongo| D[MongoTareaRepository]
     B -->|ORM=dual| E[DualTareaRepository]
-    
-    E --> F[ThreadPoolExecutor]
+
+    E --> P["🏓 Ping paralelo (max_workers=4)"]
+    P -->|ping_postgres| G[(PostgreSQL)]
+    P -->|ping_mongo| H[(MongoDB)]
+
+    P -->|ambas OK| F[Dual-Write paralelo]
+    P -->|solo Postgres OK| C
+    P -->|solo Mongo OK| D
+    P -->|ninguna OK| X[❌ Exception]
+
     F -->|Thread 1| C
     F -->|Thread 2| D
-    
-    C --> G[(SQLite/PostgreSQL)]
-    D --> H[(MongoDB)]
 ```
 
 ### Patrón de Diseño
@@ -63,7 +70,7 @@ El repositorio dual implementa el **patrón Adapter** de la arquitectura hexagon
 
 ## 🚀 Estrategia de Migración
 
-### Fase 1: Dual-Write (Escritura Doble)
+### Fase 1: Dual-Write con Ping previo
 
 ```mermaid
 sequenceDiagram
@@ -72,33 +79,36 @@ sequenceDiagram
     participant Executor as ThreadPoolExecutor
     participant SQL as SQLAlchemy Repo
     participant Mongo as MongoDB Repo
-    
-    Client->>DualRepo: save(tarea)
-    DualRepo->>Executor: submit(sql_save)
-    DualRepo->>Executor: submit(mongo_save)
-    
-    par Parallel Execution
-        Executor->>SQL: save(tarea)
-        SQL-->>Executor: result/error
-    and
-        Executor->>Mongo: save(tarea)
-        Mongo-->>Executor: result/error
-    end
-    
-    Executor-->>DualRepo: (sql_result, sql_error, mongo_result, mongo_error)
-    
-    alt Both Success
-        DualRepo-->>Client: ✅ Success
-    else Only One Success
-        DualRepo-->>Client: ⚠️ Warning Logged
-    else Both Fail
-        DualRepo-->>Client: ❌ Exception
+
+    Client->>DualRepo: save(tarea) / eliminar(id)
+    note over DualRepo,Executor: 🏓 Ping en PARALELO (ambas BDD a la vez)
+    DualRepo->>Executor: submit(_ping_postgres)
+    DualRepo->>Executor: submit(_ping_mongo)
+    Executor-->>DualRepo: postgres_ok, mongo_ok
+
+    alt Ninguna disponible
+        DualRepo-->>Client: ❌ Exception inmediata
+    else Solo Postgres disponible
+        DualRepo-->>Client: ⚠️ Warning — guardando solo en Postgres
+        DualRepo->>SQL: operación
+    else Solo Mongo disponible
+        DualRepo-->>Client: ⚠️ Warning — guardando solo en MongoDB
+        DualRepo->>Mongo: operación
+    else Ambas disponibles
+        par Escritura dual paralela
+            DualRepo->>SQL: operación
+            SQL-->>DualRepo: result/error
+        and
+            DualRepo->>Mongo: operación
+            Mongo-->>DualRepo: result/error
+        end
+        DualRepo-->>Client: ✅ Success (o ⚠️ si una falla en escritura)
     end
 ```
 
-**Operaciones:**
-- **save()**: Escribe en **ambas** bases de datos EN PARALELO usando `ThreadPoolExecutor`
-- **eliminar()**: Elimina de **ambas** bases de datos EN PARALELO
+**Operaciones con ping previo:**
+- **save()**: Ping → escribe en BDD disponibles (ambas, una, o falla)
+- **eliminar()**: Ping → elimina en BDD disponibles (ambas, una, o falla)
 
 ### Fase 2: Dual-Read (Lectura con Fallback)
 
@@ -164,43 +174,57 @@ $env:ORM="mongo"
 
 ## 🔍 Características
 
-### ✅ Ejecución Paralela
+### ✅ Ping paralelo previo a escrituras
 
-Las operaciones de escritura se ejecutan en ambas bases de datos simultáneamente usando `ThreadPoolExecutor` con 2 workers:
+Antes de cada `save()` o `eliminar()`, se hace ping en paralelo a ambas BDD. La latencia del ping = `max(ping_sql, ping_mongo)` en lugar de la suma:
 
 ```python
-# Pool de threads global (linea 16)
-executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="DualRepo")
-
-# Uso interno
-future_sql = executor.submit(lambda: self._sql_repo.save(tarea))
-future_mongo = executor.submit(lambda: self._mongo_repo.save(tarea))
+# Pings en paralelo — no suma latencias, solo espera el más lento
+future_sql   = executor.submit(_ping_postgres)
+future_mongo = executor.submit(_ping_mongo)
+postgres_ok  = future_sql.result(timeout=4)
+mongo_ok     = future_mongo.result(timeout=4)
 ```
 
-### ✅ Tolerancia a Fallos
+### ✅ Ejecución Paralela con pool ampliado
+
+El pool ahora tiene **4 workers**: 2 para pings y 2 para operaciones reales, evitando que los pings bloqueen las escrituras:
+
+```python
+# Pool de threads global — 4 workers (antes 2)
+executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="DualRepo")
+```
+
+### ✅ Imports a nivel de módulo
+
+`psycopg` y `MongoClient` se importan **una sola vez** al arrancar el módulo (no en cada llamada a `ping_postgres`/`ping_mongo`), eliminando el overhead repetido de import:
+
+### ✅ Tolerancia a Fallos con dispatch condicional
 
 ```mermaid
 flowchart TD
-    A[Operación Dual-Write] --> B{SQLAlchemy}
-    A --> C{MongoDB}
-    
-    B -->|Success| D[✓ SQL OK]
-    B -->|Fail| E[⚠️ SQL Error]
-    C -->|Success| F[✓ Mongo OK]
-    C -->|Fail| G[⚠️ Mongo Error]
-    
-    D --> H{Resultado}
-    E --> H
-    F --> H
-    G --> H
-    
-    H -->|Ambos OK| I[✅ Success]
-    H -->|Uno OK| J[⚠️ Warning]
-    H -->|Ambos Fail| K[❌ Exception]
+    A[save / eliminar] --> P["🏓 Ping paralelo"]
+    P --> B{postgres_ok}
+    P --> C{mongo_ok}
+
+    B -- No --> OnlyMongo{mongo_ok?}
+    B -- Sí --> BothCheck{mongo_ok?}
+
+    OnlyMongo -- Sí --> M["⚠️ Solo MongoDB"]
+    OnlyMongo -- No --> X["❌ Exception inmediata"]
+
+    BothCheck -- No --> S["⚠️ Solo Postgres"]
+    BothCheck -- Sí --> Dual["🔄 Dual-Write paralelo"]
+
+    Dual --> R{Resultado escritura}
+    R -->|Ambos OK| OK["✅ Success"]
+    R -->|Uno OK| W["⚠️ Warning"]
+    R -->|Ambos Fail| E["❌ Exception"]
 ```
 
-- Si **una** base de datos falla, la operación continúa con la otra
-- Si **ambas** bases de datos fallan, se lanza una excepción
+- Si **ninguna** BDD hace ping → excepción **inmediata** (sin intentar escribir)
+- Si **solo una** BDD hace ping → avisa con `⚠️ warning` y escribe en la disponible
+- Si **ambas** hacen ping → escritura dual en paralelo
 - Los errores se registran con logging detallado
 
 ### ✅ Logging Detallado
@@ -208,16 +232,23 @@ flowchart TD
 El repositorio dual incluye emojis y mensajes claros para facilitar el debugging:
 
 ```
-🔄 Dual-Write iniciado para tarea <uuid>
+🏓 Ping previo a BDD para save de <uuid>...
+🔴 Mongo no disponible: <error>          ← BDD caída
+⚠️ MongoDB no disponible. save de <uuid> se guardará SOLO en Postgres.
+✓ Operación SQLAlchemy (solo) completada
+
+# Cuando ambas están OK:
+🏓 Ping previo a BDD para save de <uuid>...
+🔄 save dual iniciado para <uuid>
 ✓ Operación SQLAlchemy completada
 ✓ Operación MongoDB completada
-✅ Dual-Write exitoso para tarea <uuid>
+✅ save dual exitoso para <uuid>
 ```
 
 **Niveles de Log:**
 - `INFO`: Inicio/completado de operaciones dual
-- `WARNING`: Fallo en una de las bases de datos
-- `ERROR`: Fallo en ambas bases de datos
+- `WARNING`: Una BDD no disponible (ping) o falló en escritura
+- `ERROR`: Ninguna BDD disponible, o ambas fallaron en escritura
 - `DEBUG`: Operaciones individuales completadas
 
 ---
@@ -281,14 +312,23 @@ dual_repo = DualTareaRepository(
 
 ### Ajustar el ThreadPoolExecutor
 
-El executor se define como variable global en `tarea_repository.py`:
+El executor se define como variable global en `tarea_repository.py`. Actualmente usa **4 workers**: 2 reservados para los pings paralelos y 2 para las operaciones reales:
 
 ```python
-# Linea 16 - Personalizar workers
+# Pool con 4 workers — ajustar si hay más concurrencia
 executor = ThreadPoolExecutor(
-    max_workers=2,  # Aumentar si necesitas más concurrencia
+    max_workers=4,  # 2 pings + 2 operaciones
     thread_name_prefix="DualRepo"
 )
+```
+
+### Ajustar timeouts de ping
+
+Los timeouts se configuran como constantes al inicio del módulo:
+
+```python
+_PING_TIMEOUT_SECS = 3   # timeout para psycopg (Postgres)
+_PING_TIMEOUT_MS   = 3000  # timeout para MongoClient
 ```
 
 ---
@@ -335,27 +375,19 @@ class MongoTareaRepository(TareaRepository):
 
 **3. Implementar en DualTareaRepository:**
 
-**Para operaciones de escritura (Dual-Write):**
+**Para operaciones de escritura (con ping previo):**
 ```python
 def nuevo_metodo_write(self, tarea: Tarea) -> None:
-    """Operación de escritura dual."""
-    logger.info(f"🔄 Nuevo método iniciado para tarea {tarea.id}")
-    
-    _, sql_error, _, mongo_error = self._execute_parallel(
-        lambda: self._sql_repo.nuevo_metodo_write(tarea),
-        lambda: self._mongo_repo.nuevo_metodo_write(tarea),
+    """Operación de escritura dual con ping previo."""
+    self._dispatch_escritura(
+        operacion="nuevo_metodo_write",
+        sql_func=lambda: self._sql_repo.nuevo_metodo_write(tarea),
+        mongo_func=lambda: self._mongo_repo.nuevo_metodo_write(tarea),
+        entidad_id=tarea.id,
     )
-    
-    if sql_error and mongo_error:
-        raise Exception("Operación falló en ambas bases de datos")
-    
-    if sql_error:
-        logger.warning(f"⚠️ SQLAlchemy falló: {sql_error}")
-    elif mongo_error:
-        logger.warning(f"⚠️ MongoDB falló: {mongo_error}")
-    else:
-        logger.info(f"✅ Operación exitosa")
 ```
+
+El método `_dispatch_escritura` se encarga del ping, dispatch condicional y logging automáticamente.
 
 **Para operaciones de lectura (Dual-Read):**
 ```python
@@ -545,4 +577,4 @@ print(f"Tarea {tarea.id} creada en ambas bases de datos")
 
 ---
 
-**Última actualización:** 2026-02-10
+**Última actualización:** 2026-02-21 — Ping paralelo previo a escrituras, imports a nivel de módulo, pool ampliado a 4 workers, dispatch condicional por disponibilidad de BDD.

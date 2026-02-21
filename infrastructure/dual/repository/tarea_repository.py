@@ -2,6 +2,10 @@ from uuid import UUID
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, Any
+import os
+# ── Imports a nivel de módulo (Patrón 10: evitar overhead de import repetido) ──
+import psycopg2
+from pymongo import MongoClient
 
 from core.domain.models.tarea import Tarea
 from core.domain.ports.tarea_repository import TareaRepository
@@ -12,8 +16,65 @@ from infrastructure.mongo.repository.tarea_repository import MongoTareaRepositor
 
 logger = logging.getLogger(__name__)
 
-# Pool de threads para ejecutar operaciones en paralelo
-executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="DualRepo")
+# ── Pool de threads compartido (Patrón 14: reutilizar pool, no crear por llamada) ──
+# max_workers=4: 2 para pings + 2 para operaciones reales en paralelo
+executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="DualRepo")
+
+# ── Configuración de conexión (variables locales en módulo → acceso más rápido) ──
+_POSTGRES_DSN = os.getenv("DATABASE_URL")
+_MONGO_DSN = os.getenv("MONGO_URI")
+_PING_TIMEOUT_SECS = 3
+_PING_TIMEOUT_MS = _PING_TIMEOUT_SECS * 1000
+
+
+def _ping_postgres() -> bool:
+    """
+    Hace ping a PostgreSQL con timeout controlado.
+
+    Returns:
+        True si la BDD está disponible, False en caso contrario.
+    """
+    try:
+        # psycopg2: connect_timeout es un kwarg separado, no parte del DSN
+        conn = psycopg2.connect(dsn=_POSTGRES_DSN, connect_timeout=_PING_TIMEOUT_SECS)
+        conn.close()
+        return True
+    except Exception as e:
+        logger.error(f"🔴 Postgres no disponible: {e}")
+        return False
+
+
+def _ping_mongo() -> bool:
+    """
+    Hace ping a MongoDB con timeout controlado.
+
+    Returns:
+        True si la BDD está disponible, False en caso contrario.
+    """
+    try:
+        client = MongoClient(_MONGO_DSN, serverSelectionTimeoutMS=_PING_TIMEOUT_MS)
+        client.admin.command("ping")
+        client.close()
+        return True
+    except Exception as e:
+        logger.error(f"🔴 Mongo no disponible: {e}")
+        return False
+
+
+def _ping_ambas_bdd() -> tuple[bool, bool]:
+    """
+    Ejecuta los pings a PostgreSQL y MongoDB EN PARALELO.
+    Latencia total = max(ping_sql, ping_mongo), no la suma.
+
+    Returns:
+        Tupla (postgres_ok, mongo_ok)
+    """
+    future_sql = executor.submit(_ping_postgres)
+    future_mongo = executor.submit(_ping_mongo)
+    # Esperamos ambos resultados (timeout máximo = _PING_TIMEOUT_SECS + margen)
+    postgres_ok = future_sql.result(timeout=_PING_TIMEOUT_SECS + 1)
+    mongo_ok = future_mongo.result(timeout=_PING_TIMEOUT_SECS + 1)
+    return postgres_ok, mongo_ok
 
 
 class DualTareaRepository(TareaRepository):
@@ -21,10 +82,11 @@ class DualTareaRepository(TareaRepository):
     Repositorio Dual que escribe y lee desde SQLAlchemy y MongoDB simultáneamente.
 
     Estrategia de Migración (según roadmap.md):
-    - ESCRITURA (save/eliminar): Se ejecuta en AMBAS bases de datos EN PARALELO.
+    - ESCRITURA (save/eliminar): Ping previo en paralelo a ambas BDD.
+      Si ambas responden → escribe en paralelo.
+      Si solo una responde → avisa y escribe solo en la disponible.
+      Si ninguna responde → falla inmediatamente sin intentar escribir.
     - LECTURA (get/list): Lee de SQLAlchemy por defecto, con fallback a MongoDB.
-
-    Esto permite una migración gradual sin downtime.
     """
 
     def __init__(
@@ -43,11 +105,15 @@ class DualTareaRepository(TareaRepository):
         self._mongo_repo = mongo_repository or MongoTareaRepository()
         logger.info("DualTareaRepository inicializado con SQLAlchemy y MongoDB")
 
+    # ──────────────────────────────────────────────────────────────────────────
+    # Métodos privados de infraestructura
+    # ──────────────────────────────────────────────────────────────────────────
+
     def _execute_parallel(
         self, sql_func: Callable[[], Any], mongo_func: Callable[[], Any]
     ) -> tuple[Any | None, Exception | None, Any | None, Exception | None]:
         """
-        Ejecuta dos operaciones en paralelo usando ThreadPoolExecutor.
+        Ejecuta dos operaciones en paralelo usando el ThreadPoolExecutor compartido.
 
         Args:
             sql_func: Función a ejecutar en SQLAlchemy
@@ -59,22 +125,21 @@ class DualTareaRepository(TareaRepository):
         sql_result, sql_error = None, None
         mongo_result, mongo_error = None, None
 
-        # Submit ambas tareas al executor
         future_sql = executor.submit(sql_func)
         future_mongo = executor.submit(mongo_func)
 
-        # Recolectar resultados a medida que se completan
+        # Recolectar resultados a medida que se completan (sin bloqueo total)
         for future in as_completed([future_sql, future_mongo]):
             try:
                 result = future.result()
-                if future == future_sql:
+                if future is future_sql:
                     sql_result = result
                     logger.debug("✓ Operación SQLAlchemy completada")
                 else:
                     mongo_result = result
                     logger.debug("✓ Operación MongoDB completada")
             except Exception as e:
-                if future == future_sql:
+                if future is future_sql:
                     sql_error = e
                     logger.error(f"✗ SQLAlchemy falló: {e}")
                 else:
@@ -83,44 +148,122 @@ class DualTareaRepository(TareaRepository):
 
         return sql_result, sql_error, mongo_result, mongo_error
 
-    def save(self, tarea: Tarea) -> None:
+    def _execute_solo_sql(self, sql_func: Callable[[], Any]) -> None:
+        """Ejecuta la operación únicamente en SQLAlchemy."""
+        try:
+            sql_func()
+            logger.debug("✓ Operación SQLAlchemy (solo) completada")
+        except Exception as e:
+            logger.error(f"✗ SQLAlchemy (solo) falló: {e}")
+            raise
+
+    def _execute_solo_mongo(self, mongo_func: Callable[[], Any]) -> None:
+        """Ejecuta la operación únicamente en MongoDB."""
+        try:
+            mongo_func()
+            logger.debug("✓ Operación MongoDB (solo) completada")
+        except Exception as e:
+            logger.error(f"✗ MongoDB (solo) falló: {e}")
+            raise
+
+    def _dispatch_escritura(
+        self,
+        operacion: str,
+        sql_func: Callable[[], Any],
+        mongo_func: Callable[[], Any],
+        entidad_id: Any,
+    ) -> None:
         """
-        Guarda la tarea en ambas bases de datos EN PARALELO (Dual-Write).
+        Orquesta una operación de escritura con ping previo.
+
+        1. Hace ping en paralelo a ambas BDD.
+        2. Según disponibilidad, despacha la operación.
 
         Args:
-            tarea: La tarea a guardar.
-
-        Raises:
-            Exception: Si falla la escritura en ambas bases de datos.
+            operacion:  Nombre de la operación para logs ('save', 'eliminar', etc.)
+            sql_func:   Función a ejecutar en SQLAlchemy
+            mongo_func: Función a ejecutar en MongoDB
+            entidad_id: ID de la entidad (solo para logs)
         """
-        logger.info(f"🔄 Dual-Write iniciado para tarea {tarea.id}")
+        logger.info(f"🏓 Ping previo a BDD para {operacion} de {entidad_id}...")
+        postgres_ok, mongo_ok = _ping_ambas_bdd()
 
-        # Ejecutar ambas operaciones en paralelo
-        _, sql_error, _, mongo_error = self._execute_parallel(
-            lambda: self._sql_repo.save(tarea),
-            lambda: self._mongo_repo.save(tarea),
-        )
+        # ── Ambas BDD caídas → falla rápida ──────────────────────────────────
+        if not postgres_ok and not mongo_ok:
+            msg = (
+                f"❌ {operacion} abortado: ninguna BDD disponible "
+                f"(Postgres={postgres_ok}, Mongo={mongo_ok})"
+            )
+            logger.error(msg)
+            raise Exception(msg)
 
-        # Si ambas fallaron, lanzar excepción
+        # ── Solo Postgres disponible ──────────────────────────────────────────
+        if postgres_ok and not mongo_ok:
+            logger.warning(
+                f"⚠️ MongoDB no disponible. {operacion} de {entidad_id} "
+                f"se guardará SOLO en Postgres."
+            )
+            self._execute_solo_sql(sql_func)
+            return
+
+        # ── Solo MongoDB disponible ───────────────────────────────────────────
+        if mongo_ok and not postgres_ok:
+            logger.warning(
+                f"⚠️ Postgres no disponible. {operacion} de {entidad_id} "
+                f"se guardará SOLO en MongoDB."
+            )
+            self._execute_solo_mongo(mongo_func)
+            return
+
+        # ── Ambas disponibles → escritura dual en paralelo ───────────────────
+        logger.info(f"🔄 {operacion} dual iniciado para {entidad_id}")
+        _, sql_error, _, mongo_error = self._execute_parallel(sql_func, mongo_func)
+
         if sql_error and mongo_error:
             error_msg = (
-                f"Dual-Write falló en ambas bases de datos. "
+                f"{operacion} falló en ambas bases de datos. "
                 f"SQLAlchemy: {sql_error}. MongoDB: {mongo_error}"
             )
             logger.error(f"❌ {error_msg}")
             raise Exception(error_msg)
 
-        # Log de advertencia si solo una falló
         if sql_error:
-            logger.warning(f"⚠️ SQLAlchemy falló pero MongoDB tuvo éxito para tarea {tarea.id}")
+            logger.warning(f"⚠️ SQLAlchemy falló pero MongoDB tuvo éxito en {operacion} {entidad_id}")
         elif mongo_error:
-            logger.warning(f"⚠️ MongoDB falló pero SQLAlchemy tuvo éxito para tarea {tarea.id}")
+            logger.warning(f"⚠️ MongoDB falló pero SQLAlchemy tuvo éxito en {operacion} {entidad_id}")
         else:
-            logger.info(f"✅ Dual-Write exitoso para tarea {tarea.id}")
+            logger.info(f"✅ {operacion} dual exitoso para {entidad_id}")
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Interfaz pública
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def save(self, tarea: Tarea) -> None:
+        """
+        Guarda la tarea con ping previo a ambas BDD.
+
+        - Si ambas responden: escritura en paralelo.
+        - Si solo una responde: guarda solo en la disponible + warning.
+        - Si ninguna responde: lanza excepción inmediata.
+
+        Args:
+            tarea: La tarea a guardar.
+
+        Raises:
+            Exception: Si ninguna BDD está disponible, o si la escritura falla en ambas.
+        """
+        self._dispatch_escritura(
+            operacion="save",
+            sql_func=lambda: self._sql_repo.save(tarea),
+            mongo_func=lambda: self._mongo_repo.save(tarea),
+            entidad_id=tarea.id,
+        )
 
     def get(self, tarea_id: UUID) -> Tarea | None:
         """
         Obtiene una tarea, intentando SQLAlchemy primero, luego MongoDB (Dual-Read).
+
+        No hace ping previo: la lectura es tolerante a fallos por diseño.
 
         Args:
             tarea_id: El ID de la tarea.
@@ -156,6 +299,8 @@ class DualTareaRepository(TareaRepository):
         Lista todas las tareas desde SQLAlchemy (base de datos "principal").
         Con fallback a MongoDB si falla.
 
+        No hace ping previo: la lectura es tolerante a fallos por diseño.
+
         Returns:
             Lista de todas las tareas.
         """
@@ -168,7 +313,6 @@ class DualTareaRepository(TareaRepository):
         except Exception as e:
             logger.warning(f"⚠️ Error listando de SQLAlchemy: {e}, intentando MongoDB")
 
-            # Fallback a MongoDB
             try:
                 tareas = self._mongo_repo.list()
                 logger.info(f"✓ Listadas {len(tareas)} tareas de MongoDB (fallback)")
@@ -182,40 +326,21 @@ class DualTareaRepository(TareaRepository):
 
     def eliminar(self, tarea_id: UUID) -> None:
         """
-        Elimina una tarea de ambas bases de datos EN PARALELO (Dual-Delete).
+        Elimina una tarea con ping previo a ambas BDD.
+
+        - Si ambas responden: eliminación en paralelo.
+        - Si solo una responde: elimina solo en la disponible + warning.
+        - Si ninguna responde: lanza excepción inmediata.
 
         Args:
             tarea_id: El ID de la tarea a eliminar.
 
         Raises:
-            Exception: Si falla la eliminación en ambas bases de datos.
+            Exception: Si ninguna BDD está disponible, o si la eliminación falla en ambas.
         """
-        logger.info(f"🗑️ Dual-Delete iniciado para tarea {tarea_id}")
-
-        # Ejecutar ambas operaciones de eliminación en paralelo
-        _, sql_error, _, mongo_error = self._execute_parallel(
-            lambda: self._sql_repo.eliminar(tarea_id),
-            lambda: self._mongo_repo.eliminar(tarea_id),
+        self._dispatch_escritura(
+            operacion="eliminar",
+            sql_func=lambda: self._sql_repo.eliminar(tarea_id),
+            mongo_func=lambda: self._mongo_repo.eliminar(tarea_id),
+            entidad_id=tarea_id,
         )
-
-        # Si ambas fallaron, lanzar excepción
-        if sql_error and mongo_error:
-            error_msg = (
-                f"Dual-Delete falló en ambas bases de datos. "
-                f"SQLAlchemy: {sql_error}. MongoDB: {mongo_error}"
-            )
-            logger.error(f"❌ {error_msg}")
-            raise Exception(error_msg)
-
-        # Log de advertencia si solo una falló
-        if sql_error:
-            logger.warning(
-                f"⚠️ SQLAlchemy falló pero MongoDB eliminó tarea {tarea_id}"
-            )
-        elif mongo_error:
-            logger.warning(
-                f"⚠️ MongoDB falló pero SQLAlchemy eliminó tarea {tarea_id}"
-            )
-        else:
-            logger.info(f"✅ Dual-Delete exitoso para tarea {tarea_id}")
-
