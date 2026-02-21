@@ -1,6 +1,6 @@
 """
 Tests para el DualTareaRepository.
-Verifica que las operaciones se ejecuten en paralelo en ambas bases de datos.
+Verifica operaciones duales, Circuit Breaker, Retry y fallback.
 """
 
 import pytest
@@ -41,6 +41,10 @@ class TestDualTareaRepository:
             descripcion="Descripción de prueba",
             estado=EstadoTarea.PENDIENTE,
         )
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Tests de operaciones básicas (save, get, list, eliminar)
+    # ──────────────────────────────────────────────────────────────────────────
 
     def test_save_ejecuta_en_ambos_repositorios(
         self, dual_repo, mock_sql_repo, mock_mongo_repo, tarea_ejemplo
@@ -259,6 +263,155 @@ class TestDualTareaRepository:
         assert "Error 1" in str(sql_error)
         assert "Error 2" in str(mongo_error)
 
+    # ──────────────────────────────────────────────────────────────────────────
+    # Tests de Circuit Breaker integrado en DualTareaRepository
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def test_get_skips_sql_when_circuit_open(
+        self, dual_repo, mock_sql_repo, mock_mongo_repo, tarea_ejemplo
+    ):
+        """get() va directo a Mongo si el Circuit Breaker de SQL está OPEN."""
+        # Arrange — Forzar apertura del circuito SQL
+        for _ in range(3):
+            dual_repo._sql_circuit.record_failure()
+        assert dual_repo._sql_circuit.state == "OPEN"
+
+        mock_mongo_repo.get.return_value = tarea_ejemplo
+
+        # Act
+        resultado = dual_repo.get(tarea_ejemplo.id)
+
+        # Assert
+        assert resultado == tarea_ejemplo
+        mock_sql_repo.get.assert_not_called()  # SQL fue saltado
+        mock_mongo_repo.get.assert_called_once_with(tarea_ejemplo.id)
+
+    def test_list_skips_sql_when_circuit_open(
+        self, dual_repo, mock_sql_repo, mock_mongo_repo, tarea_ejemplo
+    ):
+        """list() va directo a Mongo si el Circuit Breaker de SQL está OPEN."""
+        # Arrange — Forzar apertura del circuito SQL
+        for _ in range(3):
+            dual_repo._sql_circuit.record_failure()
+
+        tareas = [tarea_ejemplo]
+        mock_mongo_repo.list.return_value = tareas
+
+        # Act
+        resultado = dual_repo.list()
+
+        # Assert
+        assert resultado == tareas
+        mock_sql_repo.list.assert_not_called()
+        mock_mongo_repo.list.assert_called_once()
+
+    def test_circuit_breaker_records_success_on_sql_read(
+        self, dual_repo, mock_sql_repo, mock_mongo_repo, tarea_ejemplo
+    ):
+        """Un get() exitoso de SQL registra éxito en el Circuit Breaker."""
+        # Arrange
+        mock_sql_repo.get.return_value = tarea_ejemplo
+
+        # Act
+        dual_repo.get(tarea_ejemplo.id)
+
+        # Assert
+        assert dual_repo._sql_circuit.state == "CLOSED"
+        assert dual_repo._sql_circuit._failure_count == 0
+
+    def test_circuit_breaker_records_failure_on_sql_exception(
+        self, dual_repo, mock_sql_repo, mock_mongo_repo
+    ):
+        """Si SQL lanza excepción en get(), se registra fallo en Circuit Breaker."""
+        # Arrange
+        mock_sql_repo.get.side_effect = Exception("SQL error")
+        mock_mongo_repo.get.return_value = None
+
+        # Act
+        dual_repo.get(uuid4())
+
+        # Assert — el fallo se contabiliza
+        assert dual_repo._sql_circuit._failure_count > 0
+
+    def test_get_fallback_when_sql_errors_accumulate(
+        self, dual_repo, mock_sql_repo, mock_mongo_repo, tarea_ejemplo
+    ):
+        """Tras 3 fallos consecutivos de SQL, get() salta directo a Mongo."""
+        # Arrange — Simular 3 fallos consecutivos en get()
+        mock_sql_repo.get.side_effect = ConnectionError("SQL down")
+        mock_mongo_repo.get.return_value = tarea_ejemplo
+
+        # Act — 3 llamadas para abrir el circuito
+        for _ in range(3):
+            dual_repo.get(tarea_ejemplo.id)
+
+        # Reset mocks para la 4ta llamada
+        mock_sql_repo.get.reset_mock()
+        mock_mongo_repo.get.reset_mock()
+        mock_mongo_repo.get.return_value = tarea_ejemplo
+
+        # Act — 4ta llamada: circuit debería estar OPEN
+        resultado = dual_repo.get(tarea_ejemplo.id)
+
+        # Assert
+        assert resultado == tarea_ejemplo
+        mock_sql_repo.get.assert_not_called()  # SQL fue saltado
+        mock_mongo_repo.get.assert_called_once()
+
+    def test_list_raises_when_both_circuits_open(
+        self, dual_repo, mock_sql_repo, mock_mongo_repo
+    ):
+        """list() lanza excepción si ambos Circuit Breakers están abiertos."""
+        # Arrange — Abrir ambos circuitos
+        for _ in range(3):
+            dual_repo._sql_circuit.record_failure()
+            dual_repo._mongo_circuit.record_failure()
+
+        # Act & Assert
+        with pytest.raises(Exception, match="Circuit Breakers"):
+            dual_repo.list()
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Tests de Retry integrado
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def test_get_recovers_from_transient_sql_error(
+        self, dual_repo, mock_sql_repo, mock_mongo_repo, tarea_ejemplo
+    ):
+        """get() reintenta y recupera de un error transitorio de SQL."""
+        # Arrange — Falla 1 vez, luego éxito
+        mock_sql_repo.get.side_effect = [
+            ConnectionError("transient"),
+            tarea_ejemplo,
+        ]
+
+        # Act
+        resultado = dual_repo.get(tarea_ejemplo.id)
+
+        # Assert
+        assert resultado == tarea_ejemplo
+        assert mock_sql_repo.get.call_count == 2
+        mock_mongo_repo.get.assert_not_called()
+
+    def test_list_recovers_from_transient_sql_error(
+        self, dual_repo, mock_sql_repo, mock_mongo_repo, tarea_ejemplo
+    ):
+        """list() reintenta y recupera de un error transitorio de SQL."""
+        # Arrange
+        tareas = [tarea_ejemplo]
+        mock_sql_repo.list.side_effect = [
+            ConnectionError("transient"),
+            tareas,
+        ]
+
+        # Act
+        resultado = dual_repo.list()
+
+        # Assert
+        assert resultado == tareas
+        assert mock_sql_repo.list.call_count == 2
+        mock_mongo_repo.list.assert_not_called()
+
 
 class TestDualTareaRepositoryIntegration:
     """Tests de integración (requieren bases de datos reales)."""
@@ -302,4 +455,3 @@ class TestDualTareaRepositoryIntegration:
 
         # Cleanup
         dual_repo.eliminar(tarea.id)
-
