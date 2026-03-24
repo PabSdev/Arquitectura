@@ -1,17 +1,10 @@
 # Arquitectura Hexagonal: Core + Infrastructure + FastAPI (usando uv)
 
 **Versión:** 1.0  
-**Estado:** Acordado para desarrollo
 
 ## 1. Objetivo del documento
 
-Este documento define la arquitectura técnica para el backend del proyecto. El enfoque es **Arquitectura Hexagonal (Ports & Adapters)** concreta para Python, gestionada con **uv**.
-
-### Metas Principales:
-1.  **Desacoplamiento Total:** El dominio (Core) no sabe de FastAPI, SQLAlchemy ni Mongo.
-2.  **Intercambiabilidad:** Cambiar de ORM o de Framework (p.ej. FastAPI a Flask) no debe reescribir la lógica de negocio.
-3.  **Migraciones sin Downtime:** Soportar escritura en dos ORMs simultáneamente durante migraciones de datos.
-4.  **Gestión Moderna:** Uso de `uv` y paquetes instalables (`editable`) en lugar de hacks con `sys.path` o múltiples entornos virtuales.
+Este documento técnico especifica los lineamientos de la arquitectura Hexagonal (Ports & Adapters) aplicada a un ecosistema Python moderno. El diseño prioriza la mantenibilidad y la evolución tecnológica mediante el aislamiento riguroso de las reglas de negocio frente a agentes externos.
 
 ---
 
