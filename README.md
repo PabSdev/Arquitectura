@@ -1,4 +1,4 @@
-# Arquitectura Hexagonal: Core + Infrastructure + FastAPI (usando uv)
+r# Arquitectura Hexagonal: Core + Infrastructure + FastAPI (usando uv)
 
 **Versión:** 1.0  
 **Estado:** Acordado para desarrollo
